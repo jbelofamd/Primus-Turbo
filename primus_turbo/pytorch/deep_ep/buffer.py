@@ -97,11 +97,11 @@ class Buffer:
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             intranode_backend: the kernels of the intranode path (`num_ranks <= 8`, no low-latency mode),
-                `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
-                else `"flydsl_v2"` on gfx1250 and `"cpp"` elsewhere (`"flydsl"` where the C++ DeepEP is not
-                built). `"cpp"` and `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot
-                writes, no channel rings, gfx1250 only) returns the same outputs with handles of its own, is
-                not capturable in a CUDA graph, and needs `num_nvl_bytes` that hold the whole batch of the
+                `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to the one of this GPU's architecture
+                (`get_rocm_arch()`): `"flydsl_v2"` on gfx1250, `"cpp"` elsewhere. `"cpp"` and `"flydsl"`
+                return interchangeable handles; `"flydsl_v2"` (direct slot writes, no channel rings, gfx1250
+                only) returns the same outputs with handles of its own, is not capturable in a CUDA graph,
+                and needs `num_nvl_bytes` that hold the whole batch of the
                 rank with the most tokens (`get_token_buffer_size_hint` with the same
                 `num_max_tokens_per_rank` on every rank; `moe_dispatch` sizes it itself). The internode and low-latency paths always use `"cpp"`.
 
@@ -329,8 +329,8 @@ class Buffer:
 
         Argument:
             num_ranks: the number of ranks.
-            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
-                default one (see `Buffer`). The backends share the dispatch values so far.
+            backend: the intranode backend the config is for, else this GPU's default one (see `Buffer`).
+                The backends share the dispatch values so far.
 
         Returns:
             config: the recommended config.
@@ -359,8 +359,7 @@ class Buffer:
 
         Argument:
             num_ranks: the number of ranks.
-            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
-                default one (see `Buffer`).
+            backend: the intranode backend the config is for, else this GPU's default one (see `Buffer`).
 
         Returns:
             config: the recommended config.
@@ -405,7 +404,7 @@ class Buffer:
             hidden_bytes: the bytes of a bf16 hidden row.
             num_ranks: the number of ranks.
             num_topk: the number of top-k experts per token.
-            backend: the intranode backend, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the default one.
+            backend: the intranode backend, else this GPU's default one.
 
         Returns:
             size: the NVL buffer size in bytes, or 0.

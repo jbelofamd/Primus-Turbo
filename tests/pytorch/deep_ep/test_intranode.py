@@ -29,7 +29,6 @@ import primus_turbo.pytorch as pt
 import primus_turbo.pytorch.deep_ep.flydsl_intranode as flydsl_intranode
 from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import combine_v2_layout, dispatch_v2_layout
-from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     _get_backend_instance,
     _resolve_backend_name,
@@ -38,14 +37,12 @@ from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
 )
 from tests.pytorch.ref.deep_ep_ref import (
     get_dispatch_layout_ref,
-    per_token_cast_to_fp8,
     tune_and_verify_intranode,
 )
 
-# builds without the C++ DeepEP (gfx1250) have the FlyDSL backends only; flydsl_v2 runs on gfx1250 only
-HAS_CPP = deep_ep_cpp is not None
-FLYDSL_BACKENDS = ["flydsl"] + (["flydsl_v2"] if IS_GFX1250 else [])
-BACKENDS = (["cpp"] if HAS_CPP else []) + FLYDSL_BACKENDS
+# gfx1250 runs the FlyDSL backends (the C++ DeepEP is not loaded there), every other GPU the C++ one
+FLYDSL_BACKENDS = ["flydsl", "flydsl_v2"]
+BACKENDS = FLYDSL_BACKENDS if IS_GFX1250 else ["cpp"]
 
 
 @instantiate_parametrized_tests
@@ -230,6 +227,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             assert torch.allclose(combined_topk_weights, topk_weights)
         dist.barrier()
 
+    @unittest.skipUnless(IS_GFX1250, "the FlyDSL backends run on gfx1250")
     @skip_if_lt_x_gpu(2)
     @parametrize("backend", FLYDSL_BACKENDS)
     def test_destroy_and_recreate(self, backend: str):
@@ -247,10 +245,8 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_default_backend(self):
-        """A Buffer with no backend and no PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND takes this GPU's default
-        and runs a dispatch + combine."""
-        os.environ.pop("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", None)
-        expected = "flydsl_v2" if IS_GFX1250 else ("cpp" if HAS_CPP else "flydsl")
+        """A Buffer with no backend takes this GPU's default and runs a dispatch + combine."""
+        expected = "flydsl_v2" if IS_GFX1250 else "cpp"
         buffer = self._init_process(None)
         assert buffer.intranode_backend == expected, (buffer.intranode_backend, expected)
         torch.manual_seed(42 + self.rank)
@@ -274,95 +270,11 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         self._check_round_trip(buffer)
         dist.barrier()
 
-    @unittest.skipUnless(HAS_CPP, "needs the C++ DeepEP")
-    @skip_if_lt_x_gpu(2)
-    @parametrize("num_sms", [8, 24])
-    def test_flydsl_matches_cpp(self, num_sms: int):
-        """The FlyDSL backend returns bit-identical tensors and handles, and takes the C++ backend's handles."""
-        cpp = self._init_process("cpp")
-        fly = pt.deep_ep.Buffer(dist.group.WORLD, int(1e9), intranode_backend="flydsl")
-        num_ranks = dist.group.WORLD.size()
-        num_tokens, hidden, num_topk, num_experts = 1027, 2880, 8, 128
-        torch.manual_seed(7 + self.rank)
-        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        scores = torch.randn((num_tokens, num_experts), device="cuda").abs() + 1
-        topk_idx = torch.topk(scores, num_topk, dim=-1, sorted=False)[1]
-        topk_idx.masked_fill_(torch.rand(topk_idx.shape, device="cuda") < 0.1, -1)
-        topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device="cuda")
-        bias = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        config = pt.deep_ep.Config(num_sms, 8, 256)
-
-        def assert_same(a, b, name):
-            if isinstance(a, tuple):
-                for i, (u, v) in enumerate(zip(a, b)):
-                    assert_same(u, v, f"{name}[{i}]")
-            elif isinstance(a, torch.Tensor):
-                assert a.dtype == b.dtype and a.shape == b.shape, name
-                assert torch.equal(
-                    a.view(torch.uint8) if a.element_size() == 1 else a,
-                    b.view(torch.uint8) if b.element_size() == 1 else b,
-                ), name
-            else:
-                assert a == b, name
-
-        layout = cpp.get_dispatch_layout(topk_idx, num_experts)
-        assert_same(layout[:4], fly.get_dispatch_layout(topk_idx, num_experts)[:4], "layout")
-        num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = layout
-        # hidden 2880 (GPT-OSS) leaves a ragged row tail; the FP8 cast needs a multiple of 128
-        for current_x in (x, per_token_cast_to_fp8(x[:, :2816].contiguous())):
-            for with_topk in (False, True):
-                args = dict(
-                    x=current_x,
-                    num_tokens_per_rank=num_tokens_per_rank,
-                    is_token_in_rank=is_token_in_rank,
-                    num_tokens_per_expert=num_tokens_per_expert,
-                    config=config,
-                )
-                if with_topk:
-                    args.update(topk_idx=topk_idx, topk_weights=topk_weights)
-                ref, out = cpp.dispatch(**args), fly.dispatch(**args)
-                assert_same(ref[:4], out[:4], f"dispatch(topk={with_topk})")
-                # notify fills only this rank's column of the rank prefix matrix; the rest is heap residue
-                assert_same(ref[4][0][:, self.rank], out[4][0][:, self.rank], "rank_prefix_matrix")
-                assert_same(ref[4][1:], out[4][1:], f"handle(topk={with_topk})")
-                handle = ref[4]
-                if with_topk:
-                    worst = num_tokens * num_ranks
-                    ref_worst, out_worst = (
-                        cpp.dispatch(**args, num_worst_tokens=worst),
-                        fly.dispatch(**args, num_worst_tokens=worst),
-                    )
-                    # rows past the received ones are left unwritten, except top-k indices (-1)
-                    n = ref[1].size(0)
-                    x_ref, x_out = ref_worst[0], out_worst[0]
-                    if isinstance(x_ref, tuple):
-                        x_ref, x_out = tuple(t[:n] for t in x_ref), tuple(t[:n] for t in x_out)
-                    else:
-                        x_ref, x_out = x_ref[:n], x_out[:n]
-                    assert_same(x_ref, x_out, "dispatch(num_worst_tokens) x")
-                    assert_same(ref_worst[1], out_worst[1], "dispatch(num_worst_tokens) topk_idx")
-                    assert_same(ref_worst[2][:n], out_worst[2][:n], "dispatch(num_worst_tokens) topk_weights")
-                else:
-                    # cached dispatch on the other backend's handle
-                    assert_same(
-                        ref[0], fly.dispatch(current_x, handle=handle, config=config)[0], "cached dispatch"
-                    )
-                if isinstance(current_x, tuple):
-                    continue
-                for combine_bias in (None, bias, (bias, bias)):
-                    combine_args = dict(x=ref[0], handle=handle, config=config, bias=combine_bias)
-                    if with_topk:
-                        combine_args.update(topk_weights=ref[2])
-                    assert_same(cpp.combine(**combine_args)[:2], fly.combine(**combine_args)[:2], "combine")
-        torch.cuda.synchronize()
-        dist.barrier()
-
     @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)
     def test_moe_ops_size_the_v2_buffer(self):
         """moe_dispatch / moe_combine on flydsl_v2 through init_buffer: the buffer is sized from the
         dispatched tokens and grows for a larger dispatch."""
-        os.environ["PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"] = "flydsl_v2"
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(backend="nccl", world_size=self.world_size, rank=self.rank, store=store)
@@ -398,7 +310,6 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
     def test_moe_ops_v2_buffer_with_uneven_tokens(self):
         """moe_dispatch / moe_combine on flydsl_v2 with a different number of tokens on every rank: the
         buffers are sized from the group's largest dispatch, so later dispatches up to it do not grow them."""
-        os.environ["PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"] = "flydsl_v2"
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(backend="nccl", world_size=self.world_size, rank=self.rank, store=store)
@@ -431,47 +342,33 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
 
 
 class IntranodeBackendSelectionTestCase(TestCase):
-    """``get_intranode_backend`` per architecture, host only (the architecture and the C++ DeepEP are
-    patched)."""
+    """``get_intranode_backend`` per architecture, host only (``get_rocm_arch`` is patched)."""
 
-    ENV = "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"
-
-    def _patched(self, gfx1250: bool, has_cpp: bool, env: Optional[str] = None):
-        environ = {k: v for k, v in os.environ.items() if k != self.ENV}
-        if env is not None:
-            environ[self.ENV] = env
-        return (
-            mock.patch.object(flydsl_intranode, "IS_GFX1250", gfx1250),
-            mock.patch.object(flydsl_intranode, "deep_ep_cpp", object() if has_cpp else None),
-            mock.patch.dict(os.environ, environ, clear=True),
-        )
-
-    def _resolve(self, gfx1250: bool, has_cpp: bool, env: Optional[str] = None, backend=None) -> str:
-        arch, cpp, environ = self._patched(gfx1250, has_cpp, env)
-        with arch, cpp, environ:
+    def _resolve(self, arch: str, backend: Optional[str] = None) -> str:
+        with mock.patch.object(flydsl_intranode, "get_rocm_arch", return_value=arch):
             return flydsl_intranode.get_intranode_backend(backend)
 
     def test_default_per_architecture(self):
-        # gfx1250 never loads the C++ DeepEP; has_cpp=True covers a build that would
-        assert self._resolve(gfx1250=True, has_cpp=False) == "flydsl_v2"
-        assert self._resolve(gfx1250=True, has_cpp=True) == "flydsl_v2"
-        assert self._resolve(gfx1250=False, has_cpp=True) == "cpp"
-        assert self._resolve(gfx1250=False, has_cpp=False) == "flydsl"
+        assert self._resolve("gfx1250") == "flydsl_v2"
+        for arch in ("gfx942", "gfx950", "gfx1100"):
+            assert self._resolve(arch) == "cpp", arch
 
-    def test_env_and_argument_override_the_default(self):
-        for gfx1250, has_cpp in ((True, False), (False, True)):
-            for env in ("cpp", "flydsl", "flydsl_v2", " FlyDSL "):
-                assert self._resolve(gfx1250, has_cpp, env=env) == env.strip().lower()
-            assert self._resolve(gfx1250, has_cpp, env="cpp", backend="flydsl") == "flydsl"
+    def test_no_environment_variable_picks_the_backend(self):
+        with mock.patch.dict(os.environ, {"PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND": "flydsl"}):
+            assert self._resolve("gfx1250") == "flydsl_v2"
+            assert self._resolve("gfx950") == "cpp"
+
+    def test_argument_overrides_the_default(self):
+        for arch in ("gfx1250", "gfx950"):
+            for backend in ("cpp", "flydsl", "flydsl_v2", " FlyDSL "):
+                assert self._resolve(arch, backend) == backend.strip().lower()
         with self.assertRaisesRegex(ValueError, "Unknown DeepEP intranode backend"):
-            self._resolve(True, False, env="v2")
+            self._resolve("gfx1250", "v2")
 
-    def test_flydsl_v2_off_gfx1250_names_the_alternatives(self):
-        arch, cpp, environ = self._patched(gfx1250=False, has_cpp=True)
+    def test_flydsl_v2_off_gfx1250_names_the_default(self):
         with (
-            arch,
-            cpp,
-            environ,
+            mock.patch.object(flydsl_intranode, "IS_GFX1250", False),
+            mock.patch.object(flydsl_intranode, "get_rocm_arch", return_value="gfx950"),
             self.assertRaisesRegex(RuntimeError, "gfx1250 only.*'cpp' \\(the default\\)"),
         ):
             flydsl_intranode.FlyDSLIntranodeRuntime(None, 0, None, version=2)

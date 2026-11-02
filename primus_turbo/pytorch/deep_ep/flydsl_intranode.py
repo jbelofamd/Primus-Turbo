@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from flydsl.runtime.device import get_rocm_arch
 
 from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
 from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
@@ -58,7 +59,7 @@ from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.deep_ep.layout_kernel import get_dispatch_layout_flydsl
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
-from ._compat import NUM_MAX_NVL_PEERS, EventHandle, deep_ep_cpp
+from ._compat import NUM_MAX_NVL_PEERS, EventHandle
 
 NUM_MAX_LOCAL_EXPERTS = 1024
 SUPPORTED_NUM_RANKS = (2, 4, 8)
@@ -72,18 +73,13 @@ def _as_i32(value: int) -> int:
 
 
 def default_intranode_backend() -> str:
-    """``flydsl_v2`` on gfx1250; elsewhere ``cpp`` where the C++ DeepEP is loaded and ``flydsl`` where it
-    is not."""
-    if IS_GFX1250:
-        return "flydsl_v2"
-    return "cpp" if deep_ep_cpp is not None else "flydsl"
+    """The intranode backend of this GPU: ``flydsl_v2`` on gfx1250, ``cpp`` elsewhere."""
+    return "flydsl_v2" if get_rocm_arch().startswith("gfx1250") else "cpp"
 
 
 def get_intranode_backend(backend: Optional[str] = None) -> str:
-    """``backend``, else ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`` (``cpp`` | ``flydsl`` | ``flydsl_v2``),
-    else ``default_intranode_backend()``."""
-    default = default_intranode_backend()
-    backend = (backend or os.environ.get("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", default)).strip().lower()
+    """``backend`` (``cpp`` | ``flydsl`` | ``flydsl_v2``), else ``default_intranode_backend()``."""
+    backend = (backend or default_intranode_backend()).strip().lower()
     if backend not in INTRANODE_BACKENDS:
         raise ValueError(
             f"Unknown DeepEP intranode backend {backend!r}; expected one of {INTRANODE_BACKENDS}"
@@ -132,8 +128,7 @@ class FlyDSLIntranodeRuntime:
         _check(
             version == 1 or IS_GFX1250,
             "the V2 backend (flydsl_v2) runs on gfx1250 only; on this GPU use intranode_backend="
-            f"'{default_intranode_backend()}' (the default) or 'flydsl', or unset "
-            "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND",
+            f"'{default_intranode_backend()}' (the default)",
         )
         self.version = version
         self.group = group
@@ -198,7 +193,7 @@ class FlyDSLIntranodeRuntime:
         _check(
             not torch.cuda.is_current_stream_capturing(),
             "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
-            "to capture DeepEP, set PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=flydsl (or intranode_backend='flydsl')",
+            "to capture the MoE token exchange on MI455X, use the all-to-all (RCCL) token dispatcher",
         )
 
     def get_local_buffer_tensor(self, dtype: torch.dtype, offset: int) -> torch.Tensor:
